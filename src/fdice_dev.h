@@ -18,6 +18,7 @@
 #include "fdice_ddp.h"
 #include "fdice_ptp.h"
 #include "fdice_rdma.h"
+#include "fdice_dcb.h"
 
 /* Forward declaration for eSwitch */
 struct fdice_eswitch;
@@ -341,6 +342,9 @@ struct fdice_dev {
 	/* Channel array and count (Phase 3.3 queue management) */
 	struct fdice_channel	*channels;
 	u16			num_channels;
+
+	/* DCB / QoS subsystem (Phase 3.12) */
+	struct fdice_dcb	dcb;
 
 	/* eSwitch / Switchdev subsystem (Phase 3.10) */
 	struct fdice_eswitch	*esw;

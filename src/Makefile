@@ -39,7 +39,9 @@ frankendrice-y := fdice_main.o \
 		  fdice_repr_tc.o \
 		  fdice_netdev.o \
 		  fdice_ethtool.o \
-		  fdice_stats.o
+		  fdice_stats.o \
+		  fdice_dcb.o \
+		  fdice_dcb_lib.o
 
 # Out-of-tree build support
 KDIR ?= /lib/modules/$(shell uname -r)/build
