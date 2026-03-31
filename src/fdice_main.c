@@ -22,6 +22,7 @@
 #include <net/devlink.h>
 
 #include "fdice_dev.h"
+#include "fdice_devlink.h"
 
 #define FDICE_DRV_NAME		"frankendrice"
 #define FDICE_DRV_VERSION	"0.1.0"
@@ -39,11 +40,9 @@ static const struct pci_device_id fdice_pci_tbl[] = {
 MODULE_DEVICE_TABLE(pci, fdice_pci_tbl);
 
 /*
- * Devlink ops — minimal for Phase 3.1, extended in Phase 3.9.
- * Defined early because devlink_alloc() requires the ops struct.
+ * Devlink ops defined in fdice_devlink.c — includes info_get, reload,
+ * flash_update, and parameter support (Phase 3.9).
  */
-static const struct devlink_ops fdice_devlink_ops = {
-};
 
 /* ---- Layer 1: Core device init (mutexes, debug, health timer) ---- */
 
@@ -231,8 +230,15 @@ void fdice_unload(struct fdice_dev *fdev)
  */
 static int fdice_register_device(struct fdice_dev *fdev)
 {
+	int err;
+
 	/* Phase 3.8: auxiliary device for RDMA */
-	/* Phase 3.9: devlink params, regions, reporters */
+
+	/* Phase 3.9: devlink params, regions */
+	err = fdice_devlink_init(fdev);
+	if (err)
+		return err;
+
 	/* Phase 3.11: netdev registration */
 	return 0;
 }
@@ -246,7 +252,10 @@ static int fdice_register_device(struct fdice_dev *fdev)
 static void fdice_unregister_device(struct fdice_dev *fdev)
 {
 	/* Phase 3.11: netdev unregistration */
+
 	/* Phase 3.9: devlink cleanup */
+	fdice_devlink_cleanup(fdev);
+
 	/* Phase 3.8: auxiliary device removal */
 }
 

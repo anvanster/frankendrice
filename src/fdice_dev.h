@@ -17,6 +17,7 @@
 #include "fdice_health_core.h"
 #include "fdice_ddp.h"
 #include "fdice_ptp.h"
+#include "fdice_rdma.h"
 
 /* E810 PCI Device IDs -- hardware constants from E810 datasheet */
 #define FDICE_DEV_ID_E810C_BACKPLANE	0x1591
@@ -326,9 +327,21 @@ struct fdice_dev {
 	/* PTP / IEEE 1588 clock subsystem (Phase 3.7) */
 	struct fdice_ptp	ptp;
 
+	/* RDMA subsystem (Phase 3.8) */
+	struct fdice_rdma	rdma;
+
 	/* Channel array and count (Phase 3.3 queue management) */
 	struct fdice_channel	*channels;
 	u16			num_channels;
+
+	/* Devlink regions (Phase 3.9) */
+	struct devlink_region	*nvm_region;
+	struct devlink_region	*sram_region;
+	struct devlink_region	*devcaps_region;
+
+	/* NVM geometry — populated by NVM discovery, used by devlink regions */
+	u32			nvm_size;
+	u32			sram_size;
 };
 
 /**
