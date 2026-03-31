@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2026, FrankenDrICE Contributors.
+
+config FRANKENDRICE
+	tristate "FrankenDrICE E810 Network Driver"
+	depends on PCI
+	depends on PCI_MSI
+	select NET_DEVLINK
+	help
+	  Clean-sheet driver for Intel E810 network adapters, informed by
+	  architectural patterns studied from mlx5 and ice/irdma.
+
+	  This driver supports the following Intel Ethernet adapters:
+	    - E810-C (100GbE QSFP28, SFP28, Backplane)
+	    - E810-XXV (25GbE QSFP28, SFP28, Backplane)
+
+	  To compile this driver as a module, choose M here. The module
+	  will be called frankendrice.

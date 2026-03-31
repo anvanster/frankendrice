@@ -1,0 +1,499 @@
+// SPDX-License-Identifier: GPL-2.0
+/* Copyright (c) 2026, FrankenDrICE Contributors. */
+
+/**
+ * fdice_hw.c - Hardware initialization and AQ command wrappers
+ *
+ * Phase 3.2 implementation: control queue bring-up, firmware version
+ * handshake, driver version announcement, capability discovery, and
+ * port info initialization.
+ *
+ * Design rationale:
+ *   - function_setup orchestrates the full firmware handshake sequence
+ *     (init AQ -> get FW version -> send driver version -> discover caps)
+ *   - Each AQ command has a type-safe wrapper that builds the descriptor,
+ *     calls fdice_aq_send_cmd(), and parses the response into domain structs
+ *   - MAC type detection maps PCI device IDs to generation identifiers
+ *   - The hw_ops vtable exposes the core subsystem wrappers; other
+ *     subsystems are NULL stubs until later phases
+ *
+ * All functions use fdice_ prefix. Binary layouts of AQ parameter structs
+ * match E810 firmware expectations (below-AQ boundary), but naming and
+ * higher-level abstractions are original.
+ */
+
+#include <linux/module.h>
+#include <linux/pci.h>
+#include <linux/kernel.h>
+#include <linux/errno.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/ctype.h>
+
+#include "fdice_dev.h"
+
+/* Driver version constants for opcode 0x0002 */
+#define FDICE_DRV_VER_MAJOR	0
+#define FDICE_DRV_VER_MINOR	1
+#define FDICE_DRV_VER_BUILD	0
+#define FDICE_DRV_VER_SUBBUILD	0
+
+static const char fdice_drv_string[] = "frankendrice";
+
+/* ---- MAC type detection ---- */
+
+/**
+ * fdice_detect_mac_type - Map PCI device ID to MAC generation
+ * @hw: hardware instance with device_id already populated
+ *
+ * Sets hw->mac_type based on the PCI device ID. Currently all
+ * supported IDs are E810 variants. Returns -ENODEV for unrecognized
+ * device IDs to prevent operating on unsupported hardware.
+ *
+ * Return: 0 on success, -ENODEV for unrecognized device ID.
+ */
+static int fdice_detect_mac_type(struct fdice_hw *hw)
+{
+	switch (hw->device_id) {
+	case FDICE_DEV_ID_E810C_BACKPLANE:
+	case FDICE_DEV_ID_E810C_QSFP:
+	case FDICE_DEV_ID_E810C_SFP:
+	case FDICE_DEV_ID_E810_XXV_BACKPLANE:
+	case FDICE_DEV_ID_E810_XXV_QSFP:
+	case FDICE_DEV_ID_E810_XXV_SFP:
+		hw->mac_type = FDICE_MAC_E810;
+		break;
+	default:
+		hw->mac_type = FDICE_MAC_UNKNOWN;
+		dev_err(&hw->pdev->dev,
+			"unrecognized device ID 0x%04x, cannot determine MAC type\n",
+			hw->device_id);
+		return -ENODEV;
+	}
+
+	return 0;
+}
+
+/* ---- AQ command wrappers ---- */
+
+/**
+ * fdice_hw_get_fw_ver - Query firmware and API version
+ * @hw: hardware instance
+ * @ver: output structure for version data
+ *
+ * Issues opcode 0x0001 (Get Version) as a direct command. The firmware
+ * returns version info in the descriptor params -- no indirect buffer
+ * needed. Parsed fields are written into the caller's fdice_fw_ver.
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+int fdice_hw_get_fw_ver(struct fdice_hw *hw, struct fdice_fw_ver *ver)
+{
+	struct fdice_aq_desc desc;
+	struct fdice_aqp_get_ver *resp;
+	int err;
+
+	if (!ver)
+		return -EINVAL;
+
+	fdice_aq_prep_desc(&desc, FDICE_AQ_OPC_GET_VER);
+	resp = (struct fdice_aqp_get_ver *)desc.params.raw;
+
+	err = fdice_aq_send_cmd(hw, &desc, NULL, 0);
+	if (err)
+		return err;
+
+	ver->fw_branch = resp->fw_branch;
+	ver->fw_major  = resp->fw_major;
+	ver->fw_minor  = resp->fw_minor;
+	ver->fw_patch  = resp->fw_patch;
+	ver->fw_build  = le32_to_cpu(resp->fw_build);
+	ver->api_branch = resp->api_branch;
+	ver->api_major  = resp->api_major;
+	ver->api_minor  = resp->api_minor;
+	ver->api_patch  = resp->api_patch;
+
+	return 0;
+}
+
+/**
+ * fdice_hw_send_driver_ver - Announce driver version to firmware
+ * @hw: hardware instance
+ *
+ * Issues opcode 0x0002 (Send Driver Version) with the FrankenDrICE
+ * version string. This is an indirect command -- the driver string
+ * is passed in a DMA-addressable buffer. The firmware logs this
+ * for diagnostics but the response carries no meaningful data.
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+int fdice_hw_send_driver_ver(struct fdice_hw *hw)
+{
+	struct fdice_aq_desc desc;
+	struct fdice_aqp_driver_ver *cmd;
+	u16 slen;
+
+	fdice_aq_prep_desc(&desc, FDICE_AQ_OPC_DRIVER_VER);
+	desc.flags |= cpu_to_le16(FDICE_AQ_FLAG_RD);
+
+	cmd = (struct fdice_aqp_driver_ver *)desc.params.raw;
+	cmd->major_ver    = FDICE_DRV_VER_MAJOR;
+	cmd->minor_ver    = FDICE_DRV_VER_MINOR;
+	cmd->build_ver    = FDICE_DRV_VER_BUILD;
+	cmd->subbuild_ver = FDICE_DRV_VER_SUBBUILD;
+
+	/*
+	 * Compute the length of the ASCII driver string to send.
+	 * Only ASCII characters are accepted by the firmware; stop
+	 * at the first non-ASCII or NUL byte.
+	 */
+	for (slen = 0; slen < sizeof(fdice_drv_string) - 1; slen++) {
+		if (!isascii(fdice_drv_string[slen]) ||
+		    !fdice_drv_string[slen])
+			break;
+	}
+
+	return fdice_aq_send_cmd(hw, &desc,
+				 (void *)fdice_drv_string, slen);
+}
+
+/**
+ * fdice_aq_list_caps - Issue a list-capabilities AQ command
+ * @hw: hardware instance
+ * @buf: caller-allocated buffer for capability elements
+ * @buf_size: size of @buf in bytes
+ * @cap_count: on output, number of capability elements returned
+ * @opc: opcode -- FDICE_AQ_OPC_LIST_FUNC_CAPS or FDICE_AQ_OPC_LIST_DEV_CAPS
+ *
+ * Low-level wrapper for opcodes 0x000A and 0x000B. The indirect buffer
+ * receives an array of fdice_aq_caps_elem structures. The count field
+ * in the descriptor params is populated by firmware on completion.
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+static int fdice_aq_list_caps(struct fdice_hw *hw, void *buf, u16 buf_size,
+			      u32 *cap_count, enum fdice_aq_opc opc)
+{
+	struct fdice_aq_desc desc;
+	struct fdice_aqp_list_caps *cmd;
+	int err;
+
+	if (opc != FDICE_AQ_OPC_LIST_FUNC_CAPS &&
+	    opc != FDICE_AQ_OPC_LIST_DEV_CAPS)
+		return -EINVAL;
+
+	fdice_aq_prep_desc(&desc, opc);
+	cmd = (struct fdice_aqp_list_caps *)desc.params.raw;
+
+	err = fdice_aq_send_cmd(hw, &desc, buf, buf_size);
+
+	if (cap_count)
+		*cap_count = le32_to_cpu(cmd->count);
+
+	return err;
+}
+
+/**
+ * fdice_parse_caps - Parse capability elements into a caps structure
+ * @caps: output capability summary
+ * @buf: buffer containing fdice_aq_caps_elem array
+ * @count: number of elements in @buf
+ *
+ * Iterates the capability element array and extracts recognized
+ * capabilities into the aggregated fdice_caps structure. Unrecognized
+ * capability IDs are silently skipped -- firmware may report more
+ * capabilities than the driver cares about.
+ */
+static void fdice_parse_caps(struct fdice_caps *caps,
+			     struct fdice_aq_caps_elem *buf, u32 count)
+{
+	u32 i;
+
+	memset(caps, 0, sizeof(*caps));
+
+	for (i = 0; i < count; i++) {
+		u16 cap_id = le16_to_cpu(buf[i].cap);
+		u32 number = le32_to_cpu(buf[i].number);
+		u32 logical_id = le32_to_cpu(buf[i].logical_id);
+		u32 phys_id = le32_to_cpu(buf[i].phys_id);
+
+		switch (cap_id) {
+		case FDICE_AQ_CAP_VALID_FUNCTIONS:
+			caps->valid_functions = number;
+			break;
+		case FDICE_AQ_CAP_VSI:
+			caps->num_vsis = (u16)number;
+			break;
+		case FDICE_AQ_CAP_RXQS:
+			caps->num_rxq = number;
+			break;
+		case FDICE_AQ_CAP_TXQS:
+			caps->num_txq = number;
+			break;
+		case FDICE_AQ_CAP_MSIX:
+			caps->num_msix = number;
+			break;
+		case FDICE_AQ_CAP_MAX_MTU:
+			caps->max_mtu = number;
+			break;
+		case FDICE_AQ_CAP_RSS:
+			caps->rss_table_size = number;
+			caps->rss_table_entry_width = logical_id;
+			break;
+		case FDICE_AQ_CAP_SRIOV:
+			/* number unused; VF count comes from VF cap */
+			break;
+		case FDICE_AQ_CAP_VF:
+			caps->num_vfs = number;
+			break;
+		case FDICE_AQ_CAP_FD:
+			caps->fd_fltr_guar = number;
+			caps->fd_fltr_best_effort = logical_id;
+			break;
+		case FDICE_AQ_CAP_DCB:
+			caps->dcb_capable = (number > 0);
+			break;
+		case FDICE_AQ_CAP_RDMA:
+			caps->rdma_capable = (number > 0);
+			break;
+		case FDICE_AQ_CAP_1588:
+			caps->ieee_1588 = (number > 0);
+			break;
+		default:
+			/* Unknown capability -- skip silently */
+			break;
+		}
+
+		/* Suppress unused-variable warnings for completeness */
+		(void)phys_id;
+	}
+}
+
+/**
+ * fdice_discover_caps - Discover and parse capabilities for a given scope
+ * @hw: hardware instance
+ * @opc: FDICE_AQ_OPC_LIST_FUNC_CAPS or FDICE_AQ_OPC_LIST_DEV_CAPS
+ * @caps: output capability summary
+ *
+ * Allocates a max-size buffer, queries firmware for capability elements,
+ * parses them into the aggregated caps structure, and frees the buffer.
+ * The max buffer (4096 bytes) is always used to avoid the firmware
+ * returning ENOMEM for truncated responses.
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+int fdice_discover_caps(struct fdice_hw *hw, enum fdice_aq_opc opc,
+			struct fdice_caps *caps)
+{
+	struct fdice_aq_caps_elem *cbuf;
+	u32 cap_count = 0;
+	int err;
+
+	cbuf = kzalloc(FDICE_AQ_MAX_BUF_LEN, GFP_KERNEL);
+	if (!cbuf)
+		return -ENOMEM;
+
+	cap_count = FDICE_AQ_MAX_BUF_LEN / sizeof(*cbuf);
+
+	err = fdice_aq_list_caps(hw, cbuf, FDICE_AQ_MAX_BUF_LEN,
+				 &cap_count, opc);
+	if (!err)
+		fdice_parse_caps(caps, cbuf, cap_count);
+
+	kfree(cbuf);
+	return err;
+}
+
+/* ---- Hardware init parameter defaults ---- */
+
+/**
+ * fdice_hw_init_params - Set default AQ sizes, timeouts, and MAC type
+ * @hw: hardware instance with device_id already populated
+ *
+ * Called early in function_setup before AQ initialization. Sets
+ * conservative default parameters for the admin queue rings and
+ * detects the MAC generation from the PCI device ID.
+ *
+ * Return: 0 on success, -ENODEV for unrecognized device.
+ */
+int fdice_hw_init_params(struct fdice_hw *hw)
+{
+	int err;
+
+	err = fdice_detect_mac_type(hw);
+	if (err)
+		return err;
+
+	/* Admin queue ring parameters -- conservative defaults */
+	hw->num_sq_entries = FDICE_AQ_NUM_SQ_ENTRIES;
+	hw->num_rq_entries = FDICE_AQ_NUM_RQ_ENTRIES;
+	hw->sq_buf_size    = FDICE_AQ_SQ_BUF_SIZE;
+	hw->rq_buf_size    = FDICE_AQ_RQ_BUF_SIZE;
+	hw->aq_timeout_ms  = FDICE_AQ_TIMEOUT_MS;
+
+	/* Attach the hw_ops vtable */
+	hw->ops = &fdice_hw_ops;
+
+	return 0;
+}
+
+/* ---- Function setup / teardown (Layer 3) ---- */
+
+/**
+ * fdice_function_setup - Initialize hardware interface via admin queue
+ * @fdev: fdice device
+ *
+ * Third init layer. Performs the full firmware handshake sequence:
+ *   1. Detect MAC type and set AQ parameters
+ *   2. Initialize admin control queues (DMA rings)
+ *   3. Get firmware version (opcode 0x0001)
+ *   4. Send driver version (opcode 0x0002)
+ *   5. Discover function capabilities (opcode 0x000A)
+ *   6. Discover device capabilities (opcode 0x000B)
+ *   7. Allocate and initialize port info
+ *
+ * Uses goto-chain cleanup on failure to ensure all resources allocated
+ * up to the failure point are properly released.
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+int fdice_function_setup(struct fdice_dev *fdev)
+{
+	struct fdice_hw *hw = &fdev->hw;
+	int err;
+
+	/* Step 1: Detect MAC type and configure AQ parameters */
+	err = fdice_hw_init_params(hw);
+	if (err) {
+		dev_err(&fdev->pdev->dev,
+			"hardware parameter init failed: %d\n", err);
+		return err;
+	}
+
+	/* Step 2: Bring up admin control queues */
+	err = fdice_ctlq_init(hw, &hw->adminq, FDICE_CTL_Q_ADMIN);
+	if (err) {
+		dev_err(&fdev->pdev->dev,
+			"admin queue init failed: %d\n", err);
+		return err;
+	}
+	hw->aq_initialized = true;
+
+	/* Step 3: Get firmware version */
+	err = fdice_hw_get_fw_ver(hw, &hw->fw);
+	if (err) {
+		dev_warn(&fdev->pdev->dev,
+			 "get FW version failed: %d, continuing\n", err);
+		/*
+		 * Non-fatal during early bring-up while AQ ring submission
+		 * is still stubbed. In production this would be fatal.
+		 */
+	} else {
+		dev_info(&fdev->pdev->dev,
+			 "FW version %u.%u.%u build %u, API %u.%u.%u\n",
+			 hw->fw.fw_major, hw->fw.fw_minor, hw->fw.fw_patch,
+			 hw->fw.fw_build,
+			 hw->fw.api_major, hw->fw.api_minor,
+			 hw->fw.api_patch);
+	}
+
+	/* Step 4: Send driver version to firmware */
+	err = fdice_hw_send_driver_ver(hw);
+	if (err) {
+		dev_warn(&fdev->pdev->dev,
+			 "send driver version failed: %d, continuing\n", err);
+		/* Non-fatal -- firmware logs it but doesn't gate on it */
+	}
+
+	/* Step 5: Discover function capabilities */
+	err = fdice_discover_caps(hw, FDICE_AQ_OPC_LIST_FUNC_CAPS,
+				  &hw->func_caps);
+	if (err) {
+		dev_warn(&fdev->pdev->dev,
+			 "function capability discovery failed: %d\n", err);
+		/* Non-fatal during stub phase */
+	}
+
+	/* Step 6: Discover device capabilities */
+	err = fdice_discover_caps(hw, FDICE_AQ_OPC_LIST_DEV_CAPS,
+				  &hw->dev_caps);
+	if (err) {
+		dev_warn(&fdev->pdev->dev,
+			 "device capability discovery failed: %d\n", err);
+		/* Non-fatal during stub phase */
+	}
+
+	/* Step 7: Allocate port info */
+	if (!hw->port_info) {
+		hw->port_info = devm_kzalloc(&fdev->pdev->dev,
+					     sizeof(*hw->port_info),
+					     GFP_KERNEL);
+		if (!hw->port_info) {
+			err = -ENOMEM;
+			goto err_shutdown_ctlq;
+		}
+	}
+
+	hw->port_info->hw = hw;
+	hw->port_info->lport = 0; /* default; updated by link status query */
+
+	return 0;
+
+err_shutdown_ctlq:
+	fdice_ctlq_shutdown(hw, &hw->adminq);
+	hw->aq_initialized = false;
+	return err;
+}
+
+/**
+ * fdice_function_teardown - Tear down hardware interface
+ * @fdev: fdice device
+ *
+ * Reverse of fdice_function_setup(). Frees port info and shuts down
+ * the admin control queues. Port info is managed by devres (devm_kzalloc)
+ * so explicit free is not needed, but we clear the pointer for safety.
+ */
+void fdice_function_teardown(struct fdice_dev *fdev)
+{
+	struct fdice_hw *hw = &fdev->hw;
+
+	/*
+	 * Port info was allocated with devm_kzalloc -- it will be freed
+	 * automatically when the PCI device is released. Clear the pointer
+	 * to prevent dangling references during partial-teardown scenarios.
+	 */
+	hw->port_info = NULL;
+
+	/* Shut down admin control queues */
+	if (hw->aq_initialized) {
+		fdice_ctlq_shutdown(hw, &hw->adminq);
+		hw->aq_initialized = false;
+	}
+
+	/* Clear capability caches */
+	memset(&hw->func_caps, 0, sizeof(hw->func_caps));
+	memset(&hw->dev_caps, 0, sizeof(hw->dev_caps));
+	memset(&hw->fw, 0, sizeof(hw->fw));
+}
+
+/* ---- hw_ops vtable instance ---- */
+
+/**
+ * fdice_hw_ops - Default hardware operation vtable
+ *
+ * Phase 3.2 populates the core subsystem. PHY and other subsystems
+ * are left NULL and will be populated by their respective phases.
+ * Callers must check for NULL before invoking optional subsystem ops.
+ */
+const struct fdice_hw_ops fdice_hw_ops = {
+	.core = {
+		.get_fw_ver      = fdice_hw_get_fw_ver,
+		.send_driver_ver = fdice_hw_send_driver_ver,
+		.get_func_caps   = NULL, /* thin wrapper added when needed */
+		.get_dev_caps    = NULL, /* thin wrapper added when needed */
+	},
+	.phy = {
+		.get_link_status = NULL, /* Phase 3.7 */
+		.set_event_mask  = NULL, /* Phase 3.7 */
+	},
+};

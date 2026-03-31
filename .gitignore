@@ -1,0 +1,14 @@
+# Internal development docs and infra — not for publishing
+internal/
+
+# Kernel module build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+.*.cmd
+.tmp_versions/
+Module.symvers
+modules.order
+.module-common.o
