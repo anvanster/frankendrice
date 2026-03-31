@@ -19,6 +19,9 @@
 #include "fdice_ptp.h"
 #include "fdice_rdma.h"
 
+/* Forward declaration for eSwitch */
+struct fdice_eswitch;
+
 /* E810 PCI Device IDs -- hardware constants from E810 datasheet */
 #define FDICE_DEV_ID_E810C_BACKPLANE	0x1591
 #define FDICE_DEV_ID_E810C_QSFP	0x1592
@@ -259,6 +262,8 @@ struct fdice_hw {
 
 /* Forward declarations for queue management */
 struct fdice_channel;
+struct fdice_txq;
+struct fdice_rxq;
 
 /* Forward declaration for flow steering */
 struct fdice_flow_steering;
@@ -309,6 +314,9 @@ struct fdice_dev {
 	unsigned long		flags;
 	struct mutex		devlink_lock;
 
+	/* Network device (Phase 3.11) */
+	struct net_device	*netdev;
+
 	/* Networking / data-path private data */
 	struct fdice_priv	priv;
 
@@ -333,6 +341,9 @@ struct fdice_dev {
 	/* Channel array and count (Phase 3.3 queue management) */
 	struct fdice_channel	*channels;
 	u16			num_channels;
+
+	/* eSwitch / Switchdev subsystem (Phase 3.10) */
+	struct fdice_eswitch	*esw;
 
 	/* Devlink regions (Phase 3.9) */
 	struct devlink_region	*nvm_region;
@@ -383,5 +394,31 @@ int fdice_discover_caps(struct fdice_hw *hw, enum fdice_aq_opc opc,
 			struct fdice_caps *caps);
 
 extern const struct fdice_hw_ops fdice_hw_ops;
+
+/* ---- Netdev registration (fdice_netdev.c) ---- */
+
+int fdice_netdev_alloc(struct fdice_dev *fdev);
+void fdice_netdev_free(struct fdice_dev *fdev);
+int fdice_netdev_register(struct fdice_dev *fdev);
+void fdice_netdev_unregister(struct fdice_dev *fdev);
+
+/* ---- Ethtool ops (fdice_ethtool.c) ---- */
+
+extern const struct ethtool_ops fdice_ethtool_ops;
+
+/* ---- Statistics (fdice_stats.c) ---- */
+
+struct rtnl_link_stats64;
+
+void fdice_stats_get(struct fdice_dev *fdev,
+		     struct rtnl_link_stats64 *stats);
+void fdice_stats_update_txq(struct fdice_txq *txq, u64 packets, u64 bytes);
+void fdice_stats_update_rxq(struct fdice_rxq *rxq, u64 packets, u64 bytes);
+void fdice_stats_inc_txq_tso(struct fdice_txq *txq, u64 packets, u64 bytes);
+void fdice_stats_inc_txq_stop(struct fdice_txq *txq);
+void fdice_stats_inc_txq_wake(struct fdice_txq *txq);
+void fdice_stats_inc_rxq_alloc_fail(struct fdice_rxq *rxq);
+void fdice_stats_inc_rxq_csum(struct fdice_rxq *rxq, bool complete, bool err);
+void fdice_stats_inc_rxq_xdp(struct fdice_rxq *rxq, u32 action);
 
 #endif /* _FDICE_DEV_H_ */

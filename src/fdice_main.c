@@ -239,8 +239,22 @@ static int fdice_register_device(struct fdice_dev *fdev)
 	if (err)
 		return err;
 
-	/* Phase 3.11: netdev registration */
+	/* Phase 3.11: netdev allocation and registration */
+	err = fdice_netdev_alloc(fdev);
+	if (err)
+		goto err_devlink_cleanup;
+
+	err = fdice_netdev_register(fdev);
+	if (err)
+		goto err_netdev_free;
+
 	return 0;
+
+err_netdev_free:
+	fdice_netdev_free(fdev);
+err_devlink_cleanup:
+	fdice_devlink_cleanup(fdev);
+	return err;
 }
 
 /**
@@ -252,6 +266,8 @@ static int fdice_register_device(struct fdice_dev *fdev)
 static void fdice_unregister_device(struct fdice_dev *fdev)
 {
 	/* Phase 3.11: netdev unregistration */
+	fdice_netdev_unregister(fdev);
+	fdice_netdev_free(fdev);
 
 	/* Phase 3.9: devlink cleanup */
 	fdice_devlink_cleanup(fdev);

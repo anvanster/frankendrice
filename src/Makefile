@@ -32,7 +32,14 @@ frankendrice-y := fdice_main.o \
 		  fdice_rdma.o \
 		  fdice_iidc.o \
 		  fdice_devlink.o \
-		  fdice_devlink_region.o
+		  fdice_devlink_region.o \
+		  fdice_eswitch.o \
+		  fdice_eswitch_br.o \
+		  fdice_repr.o \
+		  fdice_repr_tc.o \
+		  fdice_netdev.o \
+		  fdice_ethtool.o \
+		  fdice_stats.o
 
 # Out-of-tree build support
 KDIR ?= /lib/modules/$(shell uname -r)/build
