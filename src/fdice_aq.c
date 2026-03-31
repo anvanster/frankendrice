@@ -467,9 +467,11 @@ static int fdice_aq_alloc_rq_bufs(struct fdice_hw *hw,
  * @hw: hardware instance
  * @ring: ring whose registers to program
  *
- * Writes the BAL/BAH/LEN registers for one ring (SQ or RQ). The LEN
- * register write includes the enable bit to activate the ring in
- * hardware. Verifies the BAL readback to confirm the write landed.
+ * Programs a control queue ring following the E810 firmware's required
+ * register write sequence: clear HEAD and TAIL first, then write LEN
+ * with enable bit, then BAL and BAH. This ordering is critical —
+ * firmware latches the enable on the LEN write and expects HEAD/TAIL
+ * to be zeroed before the ring goes live.
  *
  * Return: 0 on success, -EIO if readback verification fails
  */
@@ -478,15 +480,19 @@ static int fdice_aq_cfg_ring_regs(struct fdice_hw *hw,
 {
 	u32 len_val;
 
-	/* Write base address low and high */
+	/* Step 1: Clear head and tail to reset ring position */
+	fdice_aq_wr32(hw, ring->reg_head, 0);
+	fdice_aq_wr32(hw, ring->reg_tail, 0);
+
+	/* Step 2: Write length with enable bit — firmware latches here */
+	len_val = (u32)ring->count | FDICE_AQ_LEN_ENABLE;
+	fdice_aq_wr32(hw, ring->reg_len, len_val);
+
+	/* Step 3: Write base address low and high */
 	fdice_aq_wr32(hw, ring->reg_bal,
 		      lower_32_bits(ring->desc_dma));
 	fdice_aq_wr32(hw, ring->reg_bah,
 		      upper_32_bits(ring->desc_dma));
-
-	/* Write length with enable bit set to activate the queue */
-	len_val = (u32)ring->count | FDICE_AQ_LEN_ENABLE;
-	fdice_aq_wr32(hw, ring->reg_len, len_val);
 
 	/* Flush posted writes */
 	fdice_aq_flush(hw);
@@ -1014,19 +1020,50 @@ int fdice_aq_send_cmd(struct fdice_hw *hw,
 		return err;
 	}
 
-	/* Block until completion or timeout */
-	wait_ret = wait_for_completion_timeout(&slot->completion,
-					       aq->timeout_jiffies);
-	if (wait_ret == 0) {
-		/* Timeout — record and clean up */
-		dev_warn(fdice_hw_to_dev(hw),
-			 "AQ cmd 0x%04x token %u timed out after %u ms\n",
-			 le16_to_cpu(desc->opcode), token,
-			 jiffies_to_msecs(aq->timeout_jiffies));
+	/*
+	 * Synchronous polling fallback: spin reading the SQ head register
+	 * until firmware advances past our descriptor. This is essential
+	 * during early init when the AQ interrupt and workqueue are not
+	 * yet wired up. On each iteration, call process_completions to
+	 * check DD flags and signal the completion.
+	 */
+	{
+		unsigned long poll_deadline;
+		bool poll_done = false;
 
-		fdice_aq_stats_record_timeout(aq,
-					      le16_to_cpu(desc->opcode));
-		slot->status = FDICE_ERR_TIMEOUT;
+		poll_deadline = jiffies + aq->timeout_jiffies;
+
+		while (time_before(jiffies, poll_deadline)) {
+			fdice_aq_process_completions(hw, aq);
+
+			if (try_wait_for_completion(&slot->completion)) {
+				poll_done = true;
+				break;
+			}
+
+			usleep_range(50, 100);
+		}
+
+		if (!poll_done) {
+			/*
+			 * Polling did not complete — fall through to
+			 * wait_for_completion as a safety net in case
+			 * an interrupt fires late.
+			 */
+			wait_ret = wait_for_completion_timeout(
+					&slot->completion,
+					msecs_to_jiffies(10));
+			if (wait_ret == 0) {
+				dev_warn(fdice_hw_to_dev(hw),
+					 "AQ cmd 0x%04x token %u timed out after %u ms\n",
+					 le16_to_cpu(desc->opcode), token,
+					 jiffies_to_msecs(aq->timeout_jiffies));
+
+				fdice_aq_stats_record_timeout(aq,
+					le16_to_cpu(desc->opcode));
+				slot->status = FDICE_ERR_TIMEOUT;
+			}
+		}
 	}
 
 	/* Copy response descriptor back to caller */

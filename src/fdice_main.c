@@ -494,8 +494,8 @@ err_devlink_free:
  * @pdev: PCI device being removed
  *
  * Sets REMOVING state to prevent races with concurrent operations,
- * then tears down all layers in reverse order. Devlink unregistered
- * first to block new operations.
+ * then tears down all layers in reverse order. devlink_unregister
+ * is deferred until after devl_ API calls complete in cleanup.
  */
 static void fdice_remove(struct pci_dev *pdev)
 {
@@ -504,9 +504,15 @@ static void fdice_remove(struct pci_dev *pdev)
 
 	set_bit(FDICE_STATE_REMOVING, &fdev->state);
 
-	devlink_unregister(devlink);
-
+	/*
+	 * Teardown order: uninit_one first (which tears down devlink
+	 * params/regions via fdice_devlink_cleanup), then unregister
+	 * devlink, then free. The REMOVING state bit prevents new
+	 * operations. devlink_unregister must come after devl_ API
+	 * calls in fdice_devlink_cleanup to avoid refcount underflow.
+	 */
 	fdice_uninit_one(fdev);
+	devlink_unregister(devlink);
 	fdice_pci_uninit(fdev);
 	fdice_mdev_uninit(fdev);
 
