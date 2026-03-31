@@ -15,6 +15,8 @@
 #include "fdice_aq.h"
 #include "fdice_eq.h"
 #include "fdice_health_core.h"
+#include "fdice_ddp.h"
+#include "fdice_ptp.h"
 
 /* E810 PCI Device IDs -- hardware constants from E810 datasheet */
 #define FDICE_DEV_ID_E810C_BACKPLANE	0x1591
@@ -178,6 +180,18 @@ enum fdice_state_bits {
 };
 
 /**
+ * enum fdice_feature_flags - Device feature capability flags
+ * @FDICE_FLAG_ADV_FEATURES: Advanced features enabled (DDP loaded)
+ *
+ * Feature flags indicate which driver subsystems are operational.
+ * FDICE_FLAG_ADV_FEATURES is cleared when DDP loading fails,
+ * putting the device into Safe Mode with basic L2 only.
+ */
+enum fdice_feature_flags {
+	FDICE_FLAG_ADV_FEATURES = 0,
+};
+
+/**
  * struct fdice_hw - Hardware interface state
  * @hw_addr: PCI BAR0 MMIO base address
  * @pdev: PCI device backpointer
@@ -271,6 +285,7 @@ struct fdice_priv {
  * @pdev: PCI device
  * @hw: Hardware interface state
  * @state: Bitmask of &enum fdice_state_bits
+ * @flags: Bitmask of &enum fdice_feature_flags
  * @devlink_lock: Serializes devlink reload vs other operations
  *
  * Embedded in devlink allocation — use fdice_dev_from_devlink() and
@@ -290,6 +305,7 @@ struct fdice_dev {
 	struct pci_dev		*pdev;
 	struct fdice_hw		hw;
 	unsigned long		state;
+	unsigned long		flags;
 	struct mutex		devlink_lock;
 
 	/* Networking / data-path private data */
@@ -301,8 +317,14 @@ struct fdice_dev {
 	/* Health monitoring subsystem (Phase 3.4) */
 	struct fdice_health	health;
 
+	/* DDP (Dynamic Device Personalization) state (Phase 3.6) */
+	struct fdice_ddp_info	ddp_info;
+
 	/* Flow steering subsystem (Phase 3.5) */
 	struct fdice_flow_steering *flow_steering;
+
+	/* PTP / IEEE 1588 clock subsystem (Phase 3.7) */
+	struct fdice_ptp	ptp;
 
 	/* Channel array and count (Phase 3.3 queue management) */
 	struct fdice_channel	*channels;

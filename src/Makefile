@@ -24,7 +24,11 @@ frankendrice-y := fdice_main.o \
 		  fdice_fs_recipe.o \
 		  fdice_fs_tc.o \
 		  fdice_fs_fdir.o \
-		  fdice_fs_ttc.o
+		  fdice_fs_ttc.o \
+		  fdice_ddp.o \
+		  fdice_flex_pipe.o \
+		  fdice_ptp.o \
+		  fdice_ptp_hw.o
 
 # Out-of-tree build support
 KDIR ?= /lib/modules/$(shell uname -r)/build
