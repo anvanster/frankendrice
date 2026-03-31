@@ -7,6 +7,7 @@
 #include <linux/types.h>
 #include <linux/pci.h>
 #include <linux/netdevice.h>
+#include <linux/etherdevice.h>
 #include <linux/bitfield.h>
 #include <linux/idr.h>
 #include <linux/xarray.h>
@@ -157,7 +158,24 @@ struct fdice_hw_ops {
 				     struct fdice_caps *caps);
 		int (*get_dev_caps)(struct fdice_hw *hw,
 				    struct fdice_caps *caps);
+		int (*read_mac_addr)(struct fdice_hw *hw);
 	} core;
+
+	/* VSI management */
+	struct {
+		int (*alloc_vsi)(struct fdice_hw *hw, u16 vsi_type,
+				 u16 *vsi_num);
+		int (*free_vsi)(struct fdice_hw *hw, u16 vsi_num);
+	} vsi;
+
+	/* TX queue management */
+	struct {
+		int (*add_txqs)(struct fdice_hw *hw, u8 num_qgrps,
+				void *qg_buf, u16 buf_size);
+		int (*dis_txqs)(struct fdice_hw *hw, u8 num_entries,
+				void *qg_buf, u16 buf_size,
+				u8 rst_type, u16 vmvf_num);
+	} txq;
 
 	/* PHY / Link -- populated in Phase 3.7 */
 	struct {
@@ -235,6 +253,10 @@ struct fdice_hw {
 
 	/* MAC type detected from device ID */
 	enum fdice_mac_type	mac_type;
+
+	/* Default MAC address read from NVM during function setup */
+	u8			mac_addr[ETH_ALEN];
+	bool			mac_addr_valid;
 
 	/* Admin Queue instance */
 	struct fdice_aq		adminq;
@@ -339,6 +361,10 @@ struct fdice_dev {
 	/* RDMA subsystem (Phase 3.8) */
 	struct fdice_rdma	rdma;
 
+	/* Default VSI index (allocated during init_once, used by ndo_open) */
+	u16			default_vsi_idx;
+	bool			default_vsi_active;
+
 	/* Channel array and count (Phase 3.3 queue management) */
 	struct fdice_channel	*channels;
 	u16			num_channels;
@@ -396,6 +422,12 @@ int fdice_hw_get_fw_ver(struct fdice_hw *hw, struct fdice_fw_ver *ver);
 int fdice_hw_send_driver_ver(struct fdice_hw *hw);
 int fdice_discover_caps(struct fdice_hw *hw, enum fdice_aq_opc opc,
 			struct fdice_caps *caps);
+
+int fdice_hw_alloc_vsi(struct fdice_hw *hw, u16 *vsi_idx);
+void fdice_hw_free_vsi(struct fdice_hw *hw, u16 vsi_idx);
+int fdice_hw_read_mac_addr(struct fdice_hw *hw);
+int fdice_hw_set_port_params(struct fdice_hw *hw, bool double_vlan);
+int fdice_hw_set_mac_cfg(struct fdice_hw *hw, u16 max_frame_size);
 
 extern const struct fdice_hw_ops fdice_hw_ops;
 

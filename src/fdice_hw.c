@@ -29,6 +29,7 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/ctype.h>
+#include <linux/etherdevice.h>
 
 #include "fdice_dev.h"
 
@@ -423,7 +424,15 @@ int fdice_function_setup(struct fdice_dev *fdev)
 		/* Non-fatal during stub phase */
 	}
 
-	/* Step 7: Allocate port info */
+	/* Step 7: Read default MAC address from NVM */
+	err = fdice_hw_read_mac_addr(hw);
+	if (err) {
+		dev_warn(&fdev->pdev->dev,
+			 "MAC address read failed: %d\n", err);
+		/* Non-fatal: random MAC fallback is always provided */
+	}
+
+	/* Step 8: Allocate port info */
 	if (!hw->port_info) {
 		hw->port_info = devm_kzalloc(&fdev->pdev->dev,
 					     sizeof(*hw->port_info),
@@ -476,6 +485,326 @@ void fdice_function_teardown(struct fdice_dev *fdev)
 	memset(&hw->fw, 0, sizeof(hw->fw));
 }
 
+/* ---- MAC Address Read ---- */
+
+/**
+ * fdice_hw_read_mac_addr - Read default MAC address from NVM via AQ
+ * @hw: hardware instance with AQ initialized
+ *
+ * Issues opcode 0x0107 (Manage MAC Read) to retrieve the factory-programmed
+ * LAN MAC address from the E810 NVM. The indirect response buffer contains
+ * one or more fdice_aqp_manage_mac_read_resp entries; we scan for the LAN
+ * type entry. On success, stores the address in hw->mac_addr and sets
+ * hw->mac_addr_valid.
+ *
+ * If the AQ command fails (e.g., during early bring-up), falls back to
+ * generating a locally administered random MAC address.
+ *
+ * Return: 0 on success (always succeeds due to random fallback).
+ */
+int fdice_hw_read_mac_addr(struct fdice_hw *hw)
+{
+	struct fdice_aqp_manage_mac_read_resp resp[4];
+	struct fdice_aq_desc desc;
+	struct fdice_aqp_manage_mac_read *cmd;
+	u16 resp_sz = sizeof(resp);
+	u16 flags;
+	int err;
+	u8 i;
+
+	memset(resp, 0, resp_sz);
+	fdice_aq_prep_desc(&desc, FDICE_AQ_OPC_MANAGE_MAC_READ);
+	cmd = (struct fdice_aqp_manage_mac_read *)desc.params.raw;
+
+	err = fdice_aq_send_cmd(hw, &desc, resp, resp_sz);
+	if (err)
+		goto fallback;
+
+	flags = le16_to_cpu(cmd->flags) & FDICE_AQ_MAC_READ_VALID_M;
+	if (!(flags & FDICE_AQ_MAC_LAN_ADDR_VALID))
+		goto fallback;
+
+	/* Scan response entries for the LAN address */
+	for (i = 0; i < cmd->num_addr && i < ARRAY_SIZE(resp); i++) {
+		if (resp[i].addr_type == FDICE_AQ_MAC_ADDR_TYPE_LAN) {
+			ether_addr_copy(hw->mac_addr, resp[i].mac_addr);
+			if (is_valid_ether_addr(hw->mac_addr)) {
+				hw->mac_addr_valid = true;
+				dev_info(&hw->pdev->dev,
+					 "MAC from NVM: %pM\n", hw->mac_addr);
+				return 0;
+			}
+		}
+	}
+
+fallback:
+	/*
+	 * Fallback: generate a locally administered random MAC.
+	 * eth_random_addr() sets the local-admin bit to avoid collisions
+	 * with real hardware addresses on the network.
+	 */
+	eth_random_addr(hw->mac_addr);
+	hw->mac_addr_valid = true;
+	dev_info(&hw->pdev->dev,
+		 "using random MAC %pM (NVM read unavailable: %d)\n",
+		 hw->mac_addr, err);
+
+	return 0;
+}
+
+/* ---- VSI Allocation / Free ---- */
+
+/**
+ * fdice_hw_alloc_vsi - Allocate a VSI via admin queue
+ * @hw: hardware instance with AQ initialized
+ * @vsi_type: VSI type (FDICE_AQ_VSI_TYPE_PF, _VF, _VMDQ2, _EMP_MNG)
+ * @vsi_num: on success, returns the allocated VSI number
+ *
+ * Issues opcode 0x0210 (Add VSI) to firmware with an empty VSI properties
+ * context. The firmware allocates a VSI of the requested type and returns
+ * the assigned VSI number in the response descriptor.
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+static int fdice_hw_alloc_vsi_aq(struct fdice_hw *hw, u16 vsi_type,
+				 u16 *vsi_num)
+{
+	struct fdice_aq_desc desc;
+	struct fdice_aqp_alloc_free_vsi *cmd;
+	struct fdice_aqp_alloc_free_vsi_resp *resp;
+	int err;
+
+	if (!vsi_num)
+		return -EINVAL;
+
+	fdice_aq_prep_desc(&desc, FDICE_AQ_OPC_ADD_VSI);
+	desc.flags |= cpu_to_le16(FDICE_AQ_FLAG_RD);
+
+	cmd = (struct fdice_aqp_alloc_free_vsi *)desc.params.raw;
+	cmd->vsi_flags = cpu_to_le16(vsi_type & 0x3);
+
+	/*
+	 * Send with no indirect buffer -- E810 firmware supports the minimal
+	 * Add VSI without a full properties context (it fills defaults).
+	 * The response overlays the same 16-byte params area.
+	 */
+	err = fdice_aq_send_cmd(hw, &desc, NULL, 0);
+	if (err) {
+		dev_err(&hw->pdev->dev,
+			"AQ add VSI (type %u) failed: %d\n", vsi_type, err);
+		return err;
+	}
+
+	resp = (struct fdice_aqp_alloc_free_vsi_resp *)desc.params.raw;
+	*vsi_num = le16_to_cpu(resp->vsi_num) & FDICE_AQ_VSI_NUM_M;
+
+	dev_dbg(&hw->pdev->dev,
+		"allocated VSI %u (type %u, used=%u, free=%u)\n",
+		*vsi_num, vsi_type,
+		le16_to_cpu(resp->vsi_used),
+		le16_to_cpu(resp->vsi_free));
+
+	return 0;
+}
+
+/**
+ * fdice_hw_alloc_vsi - Public wrapper for VSI allocation
+ * @hw: hardware instance
+ * @vsi_idx: output VSI index on success
+ *
+ * Allocates a default PF VSI. Wrapper around the AQ-level function.
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+int fdice_hw_alloc_vsi(struct fdice_hw *hw, u16 *vsi_idx)
+{
+	return fdice_hw_alloc_vsi_aq(hw, FDICE_AQ_VSI_TYPE_PF, vsi_idx);
+}
+
+/**
+ * fdice_hw_free_vsi_aq - Free a VSI via admin queue
+ * @hw: hardware instance
+ * @vsi_num: VSI number to free
+ *
+ * Issues opcode 0x0213 (Free VSI) to release the specified VSI back
+ * to firmware. The VSI must not have any active queues.
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+static int fdice_hw_free_vsi_aq(struct fdice_hw *hw, u16 vsi_num)
+{
+	struct fdice_aq_desc desc;
+	struct fdice_aqp_alloc_free_vsi *cmd;
+	int err;
+
+	fdice_aq_prep_desc(&desc, FDICE_AQ_OPC_FREE_VSI);
+
+	cmd = (struct fdice_aqp_alloc_free_vsi *)desc.params.raw;
+	cmd->vsi_num = cpu_to_le16(vsi_num | FDICE_AQ_VSI_IS_VALID);
+
+	err = fdice_aq_send_cmd(hw, &desc, NULL, 0);
+	if (err) {
+		dev_err(&hw->pdev->dev,
+			"AQ free VSI %u failed: %d\n", vsi_num, err);
+		return err;
+	}
+
+	dev_dbg(&hw->pdev->dev, "freed VSI %u\n", vsi_num);
+	return 0;
+}
+
+/**
+ * fdice_hw_free_vsi - Public wrapper for VSI deallocation
+ * @hw: hardware instance
+ * @vsi_idx: VSI index to release
+ */
+void fdice_hw_free_vsi(struct fdice_hw *hw, u16 vsi_idx)
+{
+	fdice_hw_free_vsi_aq(hw, vsi_idx);
+}
+
+/* ---- TX Queue Management ---- */
+
+/**
+ * fdice_hw_add_txqs - Enable TX queues via AQ
+ * @hw: hardware instance
+ * @num_qgrps: number of queue groups
+ * @qg_buf: buffer containing fdice_aq_add_tx_qgrp array
+ * @buf_size: total size of @qg_buf in bytes
+ *
+ * Issues opcode 0x0C30 (Add TX LAN Queues) to enable TX queues with
+ * the specified scheduling parameters. Each queue group contains a parent
+ * TEID, queue context, and scheduler node configuration.
+ *
+ * The caller must pre-populate the fdice_aq_add_tx_qgrp entries with valid
+ * parent TEIDs, queue contexts, and scheduler element info.
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+static int fdice_hw_add_txqs_aq(struct fdice_hw *hw, u8 num_qgrps,
+				void *qg_buf, u16 buf_size)
+{
+	struct fdice_aq_desc desc;
+	struct fdice_aqp_add_txqs *cmd;
+	int err;
+
+	if (!qg_buf || !num_qgrps)
+		return -EINVAL;
+
+	if (num_qgrps > FDICE_LAN_TXQ_MAX_QGRPS)
+		return -EINVAL;
+
+	fdice_aq_prep_desc(&desc, FDICE_AQ_OPC_ADD_TXQS);
+	desc.flags |= cpu_to_le16(FDICE_AQ_FLAG_RD);
+
+	cmd = (struct fdice_aqp_add_txqs *)desc.params.raw;
+	cmd->num_qgrps = num_qgrps;
+
+	err = fdice_aq_send_cmd(hw, &desc, qg_buf, buf_size);
+	if (err)
+		dev_err(&hw->pdev->dev,
+			"AQ add TXQs (%u groups) failed: %d\n",
+			num_qgrps, err);
+
+	return err;
+}
+
+/**
+ * fdice_hw_dis_txqs - Disable TX queues via AQ
+ * @hw: hardware instance
+ * @num_entries: number of queue group entries in buffer
+ * @qg_buf: buffer containing fdice_aq_dis_txq_item array
+ * @buf_size: total size of @qg_buf in bytes
+ * @rst_type: reset type (FDICE_AQ_Q_DIS_CMD_* flags)
+ * @vmvf_num: VM/VF number for reset context
+ *
+ * Issues opcode 0x0C31 (Disable TX LAN Queues) to stop the specified
+ * TX queues. The firmware drains in-flight packets before completing.
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+static int fdice_hw_dis_txqs_aq(struct fdice_hw *hw, u8 num_entries,
+				void *qg_buf, u16 buf_size,
+				u8 rst_type, u16 vmvf_num)
+{
+	struct fdice_aq_desc desc;
+	struct fdice_aqp_dis_txqs *cmd;
+	int err;
+
+	if (!qg_buf || !num_entries)
+		return -EINVAL;
+
+	fdice_aq_prep_desc(&desc, FDICE_AQ_OPC_DIS_TXQS);
+	desc.flags |= cpu_to_le16(FDICE_AQ_FLAG_RD);
+
+	cmd = (struct fdice_aqp_dis_txqs *)desc.params.raw;
+	cmd->cmd_type = rst_type & FDICE_AQ_Q_DIS_CMD_M;
+	cmd->num_entries = num_entries;
+	cmd->vmvf_and_timeout = cpu_to_le16(
+		(vmvf_num & FDICE_AQ_Q_DIS_VMVF_NUM_M) |
+		((5 << FDICE_AQ_Q_DIS_TIMEOUT_S) & FDICE_AQ_Q_DIS_TIMEOUT_M));
+
+	err = fdice_aq_send_cmd(hw, &desc, qg_buf, buf_size);
+	if (err)
+		dev_err(&hw->pdev->dev,
+			"AQ disable TXQs (%u entries, rst=%u) failed: %d\n",
+			num_entries, rst_type, err);
+
+	return err;
+}
+
+/* ---- Set Port Parameters ---- */
+
+/**
+ * fdice_hw_set_port_params - Configure port-level switching parameters
+ * @hw: hardware instance
+ * @double_vlan: enable double VLAN tag handling
+ *
+ * Issues opcode 0x0203 (Set Port Parameters) to configure port-level
+ * switching behavior. Currently supports double VLAN mode control.
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+int fdice_hw_set_port_params(struct fdice_hw *hw, bool double_vlan)
+{
+	struct fdice_aq_desc desc;
+	struct fdice_aqp_set_port_params *cmd;
+
+	fdice_aq_prep_desc(&desc, FDICE_AQ_OPC_SET_PORT_PARAMS);
+	cmd = (struct fdice_aqp_set_port_params *)desc.params.raw;
+
+	if (double_vlan)
+		cmd->cmd_flags = cpu_to_le16(FDICE_AQ_SET_PORT_DOUBLE_VLAN_ENA);
+
+	return fdice_aq_send_cmd(hw, &desc, NULL, 0);
+}
+
+/* ---- Set MAC Config ---- */
+
+/**
+ * fdice_hw_set_mac_cfg - Configure MAC frame handling
+ * @hw: hardware instance
+ * @max_frame_size: maximum frame size to accept
+ *
+ * Issues opcode 0x0603 (Set MAC Config) to configure the MAC-level
+ * frame size limit. This must be called after link configuration to
+ * ensure the MAC accepts frames up to the configured MTU.
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+int fdice_hw_set_mac_cfg(struct fdice_hw *hw, u16 max_frame_size)
+{
+	struct fdice_aq_desc desc;
+	struct fdice_aqp_set_mac_cfg *cmd;
+
+	fdice_aq_prep_desc(&desc, FDICE_AQ_OPC_SET_MAC_CFG);
+	cmd = (struct fdice_aqp_set_mac_cfg *)desc.params.raw;
+
+	cmd->max_frame_size = cpu_to_le16(max_frame_size);
+
+	return fdice_aq_send_cmd(hw, &desc, NULL, 0);
+}
+
 /* ---- hw_ops vtable instance ---- */
 
 /**
@@ -491,6 +820,15 @@ const struct fdice_hw_ops fdice_hw_ops = {
 		.send_driver_ver = fdice_hw_send_driver_ver,
 		.get_func_caps   = NULL, /* thin wrapper added when needed */
 		.get_dev_caps    = NULL, /* thin wrapper added when needed */
+		.read_mac_addr   = fdice_hw_read_mac_addr,
+	},
+	.vsi = {
+		.alloc_vsi       = fdice_hw_alloc_vsi_aq,
+		.free_vsi        = fdice_hw_free_vsi_aq,
+	},
+	.txq = {
+		.add_txqs        = fdice_hw_add_txqs_aq,
+		.dis_txqs        = fdice_hw_dis_txqs_aq,
 	},
 	.phy = {
 		.get_link_status = NULL, /* Phase 3.7 */

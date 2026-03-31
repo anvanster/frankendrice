@@ -157,14 +157,52 @@ static int fdice_open(struct net_device *netdev)
 		return -EBUSY;
 	}
 
+	if (test_bit(FDICE_STATE_RESET_IN_PROGRESS, &fdev->state)) {
+		netdev_err(netdev, "reset in progress, cannot open\n");
+		return -EBUSY;
+	}
+
+	/*
+	 * Ensure the default VSI is allocated. Normally done in
+	 * fdice_init_once(), but guard against races with devlink reload.
+	 */
+	if (!fdev->default_vsi_active) {
+		err = fdice_hw_alloc_vsi(&fdev->hw, &fdev->default_vsi_idx);
+		if (err) {
+			netdev_err(netdev,
+				   "failed to allocate default VSI: %d\n", err);
+			return err;
+		}
+		fdev->default_vsi_active = true;
+	}
+
 	fdice_init_default_params(&params, fdev);
 
+	/* Allocate channels: one RXQ + TXQ[num_tc] + NAPI per EQ vector */
 	err = fdice_alloc_channels(fdev, &params);
 	if (err) {
 		netdev_err(netdev, "failed to allocate channels: %d\n", err);
 		return err;
 	}
 
+	/*
+	 * Notify the stack of actual queue counts so that queue mapping
+	 * (e.g., XPS) is correct before we enable TX queues.
+	 */
+	err = netif_set_real_num_tx_queues(netdev,
+					   fdev->num_channels * params.num_tc);
+	if (err) {
+		netdev_err(netdev, "failed to set real TX queues: %d\n", err);
+		goto err_free_channels;
+	}
+
+	err = netif_set_real_num_rx_queues(netdev, fdev->num_channels);
+	if (err) {
+		netdev_err(netdev, "failed to set real RX queues: %d\n", err);
+		goto err_free_channels;
+	}
+
+	/* Enable queues in hardware via AQ and start NAPI */
 	err = fdice_enable_channels(fdev);
 	if (err) {
 		netdev_err(netdev, "failed to enable channels: %d\n", err);
@@ -173,6 +211,9 @@ static int fdice_open(struct net_device *netdev)
 
 	netif_carrier_on(netdev);
 	netif_tx_start_all_queues(netdev);
+
+	netdev_info(netdev, "interface up: %u channels, %u TCs, MAC %pM\n",
+		    fdev->num_channels, params.num_tc, netdev->dev_addr);
 
 	return 0;
 
@@ -196,11 +237,17 @@ static int fdice_close(struct net_device *netdev)
 	struct fdice_priv *priv = netdev_priv(netdev);
 	struct fdice_dev *fdev = priv->fdev;
 
+	/* Signal carrier loss and stop TX queues before tearing down */
 	netif_carrier_off(netdev);
 	netif_tx_stop_all_queues(netdev);
 
+	/* Disable NAPI and queues in hardware (reverse of enable) */
 	fdice_disable_channels(fdev);
+
+	/* Free channel resources (reverse of alloc) */
 	fdice_free_channels(fdev);
+
+	netdev_info(netdev, "interface down\n");
 
 	return 0;
 }

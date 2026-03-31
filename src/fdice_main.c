@@ -23,6 +23,10 @@
 
 #include "fdice_dev.h"
 #include "fdice_devlink.h"
+#include "fdice_eq.h"
+#include "fdice_channel.h"
+#include "fdice_health_core.h"
+#include "fdice_fs_core.h"
 
 #define FDICE_DRV_NAME		"frankendrice"
 #define FDICE_DRV_VERSION	"0.1.0"
@@ -161,10 +165,46 @@ static void fdice_pci_uninit(struct fdice_dev *fdev)
  */
 static int fdice_init_once(struct fdice_dev *fdev)
 {
-	/* Phase 3.3: queue structures, EQ table */
-	/* Phase 3.4: health subsystem */
-	/* Phase 3.5: flow steering tree */
+	u16 num_comp;
+	int err;
+
+	/* EQ table: one completion EQ per channel, bounded by MSI-X */
+	num_comp = min_t(u16, num_online_cpus(),
+			 fdev->hw.func_caps.num_msix > 1 ?
+			 fdev->hw.func_caps.num_msix - 1 : 1);
+	if (num_comp == 0)
+		num_comp = 1;
+
+	err = fdice_eq_table_init(fdev, num_comp);
+	if (err) {
+		dev_err(&fdev->pdev->dev,
+			"EQ table init failed: %d\n", err);
+		return err;
+	}
+
+	/* Allocate default PF VSI */
+	err = fdice_hw_alloc_vsi(&fdev->hw, &fdev->default_vsi_idx);
+	if (err) {
+		dev_err(&fdev->pdev->dev,
+			"default VSI allocation failed: %d\n", err);
+		goto err_eq_cleanup;
+	}
+	fdev->default_vsi_active = true;
+
+	/* Health monitoring subsystem */
+	err = fdice_health_init(fdev);
+	if (err) {
+		dev_warn(&fdev->pdev->dev,
+			 "health init failed: %d, continuing without health monitoring\n",
+			 err);
+		/* Non-fatal: driver can operate without health monitoring */
+	}
+
 	return 0;
+
+err_eq_cleanup:
+	fdice_eq_table_cleanup(fdev);
+	return err;
 }
 
 /**
@@ -175,9 +215,17 @@ static int fdice_init_once(struct fdice_dev *fdev)
  */
 static void fdice_cleanup_once(struct fdice_dev *fdev)
 {
-	/* Phase 3.5: flow steering cleanup */
-	/* Phase 3.4: health cleanup */
-	/* Phase 3.3: queue structure cleanup */
+	/* Health monitoring teardown */
+	fdice_health_cleanup(fdev);
+
+	/* Release default VSI */
+	if (fdev->default_vsi_active) {
+		fdice_hw_free_vsi(&fdev->hw, fdev->default_vsi_idx);
+		fdev->default_vsi_active = false;
+	}
+
+	/* Tear down EQ table and release MSI-X vectors */
+	fdice_eq_table_cleanup(fdev);
 }
 
 /* ---- Layer 5: Hardware activation ---- */
@@ -194,10 +242,20 @@ static void fdice_cleanup_once(struct fdice_dev *fdev)
  */
 int fdice_load(struct fdice_dev *fdev)
 {
-	/* Phase 3.3: enable queues, start channels */
-	/* Phase 3.4: start health polling */
-	/* Phase 3.5: activate flow steering */
-	/* Phase 3.6: load DDP package */
+	int err;
+
+	/* Activate flow steering subsystem */
+	err = fdice_flow_steering_init(fdev);
+	if (err) {
+		dev_warn(&fdev->pdev->dev,
+			 "flow steering init failed: %d, advanced steering unavailable\n",
+			 err);
+		/* Non-fatal: basic L2 forwarding still works */
+	}
+
+	/* Start health polling */
+	fdice_health_start(fdev);
+
 	return 0;
 }
 
@@ -210,10 +268,11 @@ int fdice_load(struct fdice_dev *fdev)
  */
 void fdice_unload(struct fdice_dev *fdev)
 {
-	/* Phase 3.6: DDP cleanup */
-	/* Phase 3.5: deactivate flow steering */
-	/* Phase 3.4: stop health polling */
-	/* Phase 3.3: disable queues, stop channels */
+	/* Stop health polling before tearing down hardware */
+	fdice_health_stop(fdev);
+
+	/* Deactivate flow steering */
+	fdice_flow_steering_cleanup(fdev);
 }
 
 /* ---- Layer 6: Device registration ---- */
@@ -239,10 +298,24 @@ static int fdice_register_device(struct fdice_dev *fdev)
 	if (err)
 		return err;
 
-	/* Phase 3.11: netdev allocation and registration */
+	/*
+	 * The factory MAC address was already read from NVM during
+	 * fdice_function_setup(). If that failed, a random MAC was
+	 * generated as fallback, so hw.mac_addr is always valid here.
+	 */
+
+	/* Allocate and configure netdev */
 	err = fdice_netdev_alloc(fdev);
 	if (err)
 		goto err_devlink_cleanup;
+
+	/*
+	 * Set the hardware MAC address on the netdev. Use the NVM MAC
+	 * if valid, otherwise the random MAC from fdice_netdev_alloc
+	 * is already set via eth_hw_addr_random().
+	 */
+	if (fdev->hw.mac_addr_valid)
+		eth_hw_addr_set(fdev->netdev, fdev->hw.mac_addr);
 
 	err = fdice_netdev_register(fdev);
 	if (err)
