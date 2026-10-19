@@ -445,7 +445,7 @@ void fdice_health_port_reporter_create(struct fdice_dev *fdev)
 
 	health->port_reporter =
 		devl_health_reporter_create(devlink, &fdice_health_port_ops,
-					    0, fdev);
+					    fdev);
 	if (IS_ERR(health->port_reporter)) {
 		dev_warn(&fdev->pdev->dev,
 			 "Failed to create port health reporter: %pe\n",

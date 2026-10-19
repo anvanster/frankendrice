@@ -418,6 +418,7 @@ int fdice_hw_init_params(struct fdice_hw *hw);
 int fdice_function_setup(struct fdice_dev *fdev);
 void fdice_function_teardown(struct fdice_dev *fdev);
 
+int fdice_hw_clear_pf_cfg(struct fdice_hw *hw);
 int fdice_hw_get_fw_ver(struct fdice_hw *hw, struct fdice_fw_ver *ver);
 int fdice_hw_send_driver_ver(struct fdice_hw *hw);
 int fdice_discover_caps(struct fdice_hw *hw, enum fdice_aq_opc opc,

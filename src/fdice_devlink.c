@@ -378,12 +378,14 @@ const struct devlink_ops fdice_devlink_ops = {
  * @devlink: devlink instance
  * @id: parameter ID
  * @ctx: parameter value context
+ * @extack: netlink extended ACK
  *
  * Return: 0 on success, negative errno if RDMA not supported.
  */
 static int
 fdice_devlink_enable_roce_get(struct devlink *devlink, u32 id,
-			      struct devlink_param_gset_ctx *ctx)
+			      struct devlink_param_gset_ctx *ctx,
+			      struct netlink_ext_ack *extack)
 {
 	struct fdice_dev *fdev = fdice_dev_from_devlink(devlink);
 
@@ -452,12 +454,14 @@ fdice_devlink_enable_roce_validate(struct devlink *devlink, u32 id,
  * @devlink: devlink instance
  * @id: parameter ID
  * @ctx: parameter value context
+ * @extack: netlink extended ACK
  *
  * Return: 0 on success, negative errno if RDMA not supported.
  */
 static int
 fdice_devlink_enable_iwarp_get(struct devlink *devlink, u32 id,
-			       struct devlink_param_gset_ctx *ctx)
+			       struct devlink_param_gset_ctx *ctx,
+			       struct netlink_ext_ack *extack)
 {
 	struct fdice_dev *fdev = fdice_dev_from_devlink(devlink);
 

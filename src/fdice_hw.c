@@ -118,6 +118,28 @@ int fdice_hw_get_fw_ver(struct fdice_hw *hw, struct fdice_fw_ver *ver)
 }
 
 /**
+ * fdice_hw_clear_pf_cfg - Clear all PF-owned firmware state
+ * @hw: hardware instance
+ *
+ * Issues opcode 0x0205 (Clear PF Config). This is a direct command
+ * with no parameters that instructs the E810 firmware to release all
+ * resources (VSIs, queues, switch elements) previously allocated to
+ * this PF. It MUST be called immediately after admin queue init and
+ * before any resource allocation — otherwise the firmware may refuse
+ * new allocations with EACCES if it still holds stale state from a
+ * previous driver load.
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+int fdice_hw_clear_pf_cfg(struct fdice_hw *hw)
+{
+	struct fdice_aq_desc desc;
+
+	fdice_aq_prep_desc(&desc, FDICE_AQ_OPC_CLEAR_PF_CFG);
+	return fdice_aq_send_cmd(hw, &desc, NULL, 0);
+}
+
+/**
  * fdice_hw_send_driver_ver - Announce driver version to firmware
  * @hw: hardware instance
  *
@@ -380,6 +402,23 @@ int fdice_function_setup(struct fdice_dev *fdev)
 	}
 	hw->aq_initialized = true;
 
+	/*
+	 * Step 2b: Clear all PF-owned firmware resources (opcode 0x0205).
+	 * This MUST be called before any resource allocation. The E810
+	 * firmware retains VSIs, queues, and switch elements across driver
+	 * reloads. Without this, a second probe (after rmmod) will see
+	 * stale state and refuse Add VSI with EACCES (AQ RC 10).
+	 */
+	err = fdice_hw_clear_pf_cfg(hw);
+	if (err) {
+		dev_warn(&fdev->pdev->dev,
+			 "clear PF config failed: %d (continuing)\n", err);
+		/*
+		 * Non-fatal: first-ever load may have no resources to clear;
+		 * firmware may return OK or a benign error in that case.
+		 */
+	}
+
 	/* Step 3: Get firmware version */
 	err = fdice_hw_get_fw_ver(hw, &hw->fw);
 	if (err) {
@@ -572,27 +611,51 @@ static int fdice_hw_alloc_vsi_aq(struct fdice_hw *hw, u16 vsi_type,
 	struct fdice_aq_desc desc;
 	struct fdice_aqp_alloc_free_vsi *cmd;
 	struct fdice_aqp_alloc_free_vsi_resp *resp;
+	struct fdice_vsi_props *props;
 	int err;
 
 	if (!vsi_num)
 		return -EINVAL;
 
+	props = kzalloc(sizeof(*props), GFP_KERNEL);
+	if (!props)
+		return -ENOMEM;
+
+	/*
+	 * Populate the VSI properties indirect buffer with minimal
+	 * configuration. The firmware requires at least the switch and
+	 * VLAN sections to be marked valid. Without this buffer the
+	 * Add VSI command returns EINVAL.
+	 */
+	props->valid_sections = cpu_to_le16(FDICE_AQ_VSI_PROP_SW_VALID |
+					    FDICE_AQ_VSI_PROP_VLAN_VALID);
+
+	/* Enable source pruning (default) */
+	props->sw_flags = FDICE_AQ_VSI_SW_FLAG_SRC_PRUNE;
+
+	/* Allow traffic from this VSI to reach the LAN */
+	props->sw_flags2 = FDICE_AQ_VSI_SW_FLAG_LAN_ENA;
+
+	/* Accept both tagged and untagged frames on TX */
+	props->inner_vlan_flags = (FDICE_AQ_VSI_INNER_VLAN_TX_MODE_ALL <<
+				   FDICE_AQ_VSI_INNER_VLAN_TX_MODE_S);
+
 	fdice_aq_prep_desc(&desc, FDICE_AQ_OPC_ADD_VSI);
-	desc.flags |= cpu_to_le16(FDICE_AQ_FLAG_RD);
+
+	/*
+	 * RD flag: we are sending data TO firmware (the props buffer).
+	 * BUF flag: an indirect buffer is attached to this descriptor.
+	 */
+	desc.flags |= cpu_to_le16(FDICE_AQ_FLAG_RD | FDICE_AQ_FLAG_BUF);
 
 	cmd = (struct fdice_aqp_alloc_free_vsi *)desc.params.raw;
 	cmd->vsi_flags = cpu_to_le16(vsi_type & 0x3);
 
-	/*
-	 * Send with no indirect buffer -- E810 firmware supports the minimal
-	 * Add VSI without a full properties context (it fills defaults).
-	 * The response overlays the same 16-byte params area.
-	 */
-	err = fdice_aq_send_cmd(hw, &desc, NULL, 0);
+	err = fdice_aq_send_cmd(hw, &desc, props, sizeof(*props));
 	if (err) {
 		dev_err(&hw->pdev->dev,
 			"AQ add VSI (type %u) failed: %d\n", vsi_type, err);
-		return err;
+		goto out_free;
 	}
 
 	resp = (struct fdice_aqp_alloc_free_vsi_resp *)desc.params.raw;
@@ -604,7 +667,9 @@ static int fdice_hw_alloc_vsi_aq(struct fdice_hw *hw, u16 vsi_type,
 		le16_to_cpu(resp->vsi_used),
 		le16_to_cpu(resp->vsi_free));
 
-	return 0;
+out_free:
+	kfree(props);
+	return err;
 }
 
 /**

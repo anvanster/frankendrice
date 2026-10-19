@@ -1067,13 +1067,20 @@ int fdice_aq_send_cmd(struct fdice_hw *hw,
 	}
 
 	/* Copy response descriptor back to caller */
-	err = slot->status;
 	memcpy(desc, &slot->desc, sizeof(*desc));
 
 	ida_free(&aq->tokens, token);
 	atomic_dec(&aq->pending_count);
 
-	return err;
+	/*
+	 * Translate FDICE_ERR_* to negative errno before returning.
+	 * All callers expect kernel-standard negative errno on failure.
+	 * Returning a positive FDICE_ERR_* value would propagate out of
+	 * probe() as a non-negative non-zero return, which causes the PCI
+	 * subsystem to leave the device in an inconsistent half-bound state
+	 * and crash on subsequent rmmod.
+	 */
+	return fdice_err_to_errno(slot->status);
 }
 
 /**

@@ -438,7 +438,7 @@ int fdice_health_tx_reporter_create(struct fdice_channel *ch)
 	ch->tx_reporter =
 		devl_health_reporter_create(devlink,
 					    &fdice_health_tx_reporter_ops,
-					    0, ch);
+					    ch);
 	if (IS_ERR(ch->tx_reporter)) {
 		int err = PTR_ERR(ch->tx_reporter);
 

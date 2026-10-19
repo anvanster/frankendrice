@@ -678,7 +678,7 @@ int fdice_health_init(struct fdice_dev *fdev)
 	/* Register device-level devlink health reporters */
 	health->fw_reporter =
 		devlink_health_reporter_create(devlink, &fdice_health_fw_ops,
-					       0, fdev);
+					       fdev);
 	if (IS_ERR(health->fw_reporter)) {
 		health->fw_reporter = NULL;
 		goto err_destroy_wq;
@@ -687,7 +687,6 @@ int fdice_health_init(struct fdice_dev *fdev)
 	health->fw_fatal_reporter =
 		devlink_health_reporter_create(devlink,
 					       &fdice_health_fw_fatal_ops,
-					       health->fatal_grace_period_ms,
 					       fdev);
 	if (IS_ERR(health->fw_fatal_reporter)) {
 		health->fw_fatal_reporter = NULL;
@@ -696,7 +695,7 @@ int fdice_health_init(struct fdice_dev *fdev)
 
 	health->port_reporter =
 		devlink_health_reporter_create(devlink, &fdice_health_port_ops,
-					       0, fdev);
+					       fdev);
 	if (IS_ERR(health->port_reporter)) {
 		health->port_reporter = NULL;
 		goto err_destroy_fw_fatal;

@@ -39,6 +39,7 @@ enum fdice_aq_opc {
 
 	/* Switch / Port management */
 	FDICE_AQ_OPC_SET_PORT_PARAMS		= 0x0203,
+	FDICE_AQ_OPC_CLEAR_PF_CFG		= 0x0205,
 	FDICE_AQ_OPC_ADD_VSI			= 0x0210,
 	FDICE_AQ_OPC_UPDATE_VSI			= 0x0211,
 	FDICE_AQ_OPC_FREE_VSI			= 0x0213,
@@ -415,6 +416,117 @@ struct fdice_aqp_set_port_params {
 } __packed;
 static_assert(sizeof(struct fdice_aqp_set_port_params) == 16,
 	      "AQ set_port_params must be exactly 16 bytes");
+
+/* ---- VSI Properties Context (indirect buffer for 0x0210/0x0211) ---- */
+
+/**
+ * struct fdice_vsi_props - VSI properties context for Add/Update VSI
+ * @valid_sections: bitmask selecting which sections firmware should process
+ * @sw_id: switch ID this VSI belongs to
+ * @sw_flags: switch flags (loopback, source pruning)
+ * @sw_flags2: extended switch flags (LAN enable, VLAN prune)
+ * @veb_stat_id: VEB statistics counter index
+ * @sec_flags: security flags (anti-spoof, dest override)
+ * @sec_reserved: reserved
+ * @port_based_inner_vlan: port-based inner VLAN tag (includes priority)
+ * @inner_vlan_reserved: reserved
+ * @inner_vlan_flags: inner VLAN TX mode and extraction mode
+ * @inner_vlan_reserved2: reserved
+ * @ingress_table: ingress UP translation table (3 bits per UP)
+ * @egress_table: egress UP translation table
+ * @port_based_outer_vlan: port-based outer VLAN tag
+ * @outer_vlan_flags: outer VLAN TX mode, tag type, extraction mode
+ * @outer_vlan_reserved: reserved
+ * @mapping_flags: queue mapping mode (contiguous vs scatter)
+ * @q_mapping: queue mapping entries (16 entries)
+ * @tc_mapping: traffic class queue mapping (8 TCs)
+ * @q_opt_rss: RSS LUT type and hash function
+ * @q_opt_tc: TC override configuration
+ * @q_opt_flags: queue option flags (PE filter enable)
+ * @q_opt_reserved: reserved
+ * @outer_up_table: outer UP to inner UP translation table
+ * @sect_10_reserved: reserved section 10
+ * @fd_options: flow director options
+ * @max_fd_fltr_dedicated: max dedicated FD filters
+ * @max_fd_fltr_shared: max shared FD filters
+ * @fd_def_q: FD default queue and group
+ * @fd_report_opt: FD report queue and priority
+ * @pasid_id: PASID identifier with validity bit
+ * @reserved: reserved trailing padding
+ *
+ * Hardware-fixed 128-byte layout matching the E810 firmware VSI properties
+ * context. Passed as the indirect DMA buffer with Add VSI (0x0210) and
+ * Update VSI (0x0211) commands.
+ */
+struct fdice_vsi_props {
+	/* switch section */
+	__le16	valid_sections;
+#define FDICE_AQ_VSI_PROP_SW_VALID		BIT(0)
+#define FDICE_AQ_VSI_PROP_SECURITY_VALID	BIT(1)
+#define FDICE_AQ_VSI_PROP_VLAN_VALID		BIT(2)
+#define FDICE_AQ_VSI_PROP_OUTER_TAG_VALID	BIT(3)
+#define FDICE_AQ_VSI_PROP_INGRESS_UP_VALID	BIT(4)
+#define FDICE_AQ_VSI_PROP_EGRESS_UP_VALID	BIT(5)
+#define FDICE_AQ_VSI_PROP_RXQ_MAP_VALID		BIT(6)
+#define FDICE_AQ_VSI_PROP_Q_OPT_VALID		BIT(7)
+#define FDICE_AQ_VSI_PROP_OUTER_UP_VALID	BIT(8)
+#define FDICE_AQ_VSI_PROP_FLOW_DIR_VALID	BIT(11)
+#define FDICE_AQ_VSI_PROP_PASID_VALID		BIT(12)
+	u8	sw_id;
+	u8	sw_flags;
+#define FDICE_AQ_VSI_SW_FLAG_ALLOW_LB		BIT(5)
+#define FDICE_AQ_VSI_SW_FLAG_LOCAL_LB		BIT(6)
+#define FDICE_AQ_VSI_SW_FLAG_SRC_PRUNE		BIT(7)
+	u8	sw_flags2;
+#define FDICE_AQ_VSI_SW_FLAG_LAN_ENA		BIT(4)
+	u8	veb_stat_id;
+	/* security section */
+	u8	sec_flags;
+#define FDICE_AQ_VSI_SEC_FLAG_ALLOW_DEST_OVRD	BIT(0)
+	u8	sec_reserved;
+	/* VLAN section */
+	__le16	port_based_inner_vlan;
+	u8	inner_vlan_reserved[2];
+	u8	inner_vlan_flags;
+#define FDICE_AQ_VSI_INNER_VLAN_TX_MODE_S	0
+#define FDICE_AQ_VSI_INNER_VLAN_TX_MODE_M	(0x3 << FDICE_AQ_VSI_INNER_VLAN_TX_MODE_S)
+#define FDICE_AQ_VSI_INNER_VLAN_TX_MODE_ALL	0x3
+#define FDICE_AQ_VSI_INNER_VLAN_EMODE_S		3
+#define FDICE_AQ_VSI_INNER_VLAN_EMODE_M		(0x3 << FDICE_AQ_VSI_INNER_VLAN_EMODE_S)
+#define FDICE_AQ_VSI_INNER_VLAN_EMODE_NOTHING	0x3
+	u8	inner_vlan_reserved2[3];
+	/* ingress/egress UP section */
+	__le32	ingress_table;
+	__le32	egress_table;
+	/* outer tag section */
+	__le16	port_based_outer_vlan;
+	u8	outer_vlan_flags;
+	u8	outer_vlan_reserved;
+	/* queue mapping section */
+	__le16	mapping_flags;
+	__le16	q_mapping[16];
+	__le16	tc_mapping[8];
+	/* queueing options section */
+	u8	q_opt_rss;
+	u8	q_opt_tc;
+	u8	q_opt_flags;
+	u8	q_opt_reserved[3];
+	/* outer UP section */
+	__le32	outer_up_table;
+	/* section 10 reserved */
+	__le16	sect_10_reserved;
+	/* flow director section */
+	__le16	fd_options;
+	__le16	max_fd_fltr_dedicated;
+	__le16	max_fd_fltr_shared;
+	__le16	fd_def_q;
+	__le16	fd_report_opt;
+	/* PASID section */
+	__le32	pasid_id;
+	u8	reserved[24];
+} __packed;
+static_assert(sizeof(struct fdice_vsi_props) == 128,
+	      "VSI properties context must be exactly 128 bytes");
 
 /* ---- Add/Update/Free VSI (indirect 0x0210/0x0211/0x0213) ---- */
 

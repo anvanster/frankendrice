@@ -346,7 +346,7 @@ int fdice_health_rx_reporter_create(struct fdice_channel *ch)
 	ch->rx_reporter =
 		devl_health_reporter_create(devlink,
 					    &fdice_health_rx_reporter_ops,
-					    0, ch);
+					    ch);
 	if (IS_ERR(ch->rx_reporter)) {
 		int err = PTR_ERR(ch->rx_reporter);
 

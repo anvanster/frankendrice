@@ -619,7 +619,7 @@ void fdice_health_fw_reporters_create(struct fdice_dev *fdev)
 
 	health->fw_reporter =
 		devl_health_reporter_create(devlink, &fdice_health_fw_ops,
-					    0, fdev);
+					    fdev);
 	if (IS_ERR(health->fw_reporter)) {
 		dev_warn(&fdev->pdev->dev,
 			 "Failed to create fw health reporter: %pe\n",
@@ -628,7 +628,6 @@ void fdice_health_fw_reporters_create(struct fdice_dev *fdev)
 
 	health->fw_fatal_reporter =
 		devl_health_reporter_create(devlink, &fdice_health_fw_fatal_ops,
-					    FDICE_FW_FATAL_GRACE_PERIOD_MS,
 					    fdev);
 	if (IS_ERR(health->fw_fatal_reporter)) {
 		dev_warn(&fdev->pdev->dev,
