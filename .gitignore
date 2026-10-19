@@ -12,3 +12,10 @@ internal/
 Module.symvers
 modules.order
 .module-common.o
+
+# Local tooling / editor state — not part of the driver
+node_modules/
+package.json
+package-lock.json
+.claude/
+.mcp.json
